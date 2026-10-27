@@ -1,4 +1,70 @@
-INHERIT: mkdocs.base.yml
+site_name: AWS DVA-C02 Notes
+docs_dir: docs
+
+theme:
+  name: material
+  custom_dir: overrides
+  # Fonts are self-hosted in docs/assets/fonts (see stylesheets/extra.css).
+  font: false
+  palette:
+    - scheme: slate
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+    - scheme: default
+      primary: custom
+      accent: custom
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+  features:
+    - navigation.indexes
+    - navigation.sections
+    - navigation.top
+    - navigation.footer
+    - search.highlight
+    - search.suggest
+    - content.code.copy
+    - toc.follow
+
+plugins:
+  - search
+
+# Bundled locally so diagrams render even where CDNs are blocked.
+extra_javascript:
+  - js/mermaid.min.js
+  - js/sidebars.js
+
+extra_css:
+  - stylesheets/extra.css
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.tilde
+
+# Fills the home page stats and module table (see hooks/home.py).
+hooks:
+  - hooks/home.py
+
+# One entry per course section; new sections are appended at the end.
 nav:
   - Home: index.md
   - "IAM and AWS cli": iam-and-aws-cli.md

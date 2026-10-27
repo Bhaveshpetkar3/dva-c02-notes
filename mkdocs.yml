@@ -1,0 +1,14 @@
+INHERIT: mkdocs.base.yml
+nav:
+  - Home: index.md
+  - "IAM and AWS cli": iam-and-aws-cli.md
+  - "EC2 Fundmentals": ec2-fundmentals.md
+  - "EC2 Instance Storage": ec2-instance-storage.md
+  - "AWS Fundamentals : ELB + ASG": aws-fundamentals-elb-asg.md
+  - "RDS + Aurora + ElastiCache": rds-aurora-elasticache.md
+  - "Route 53": route-53.md
+  - "VPC Fundamentals": vpc-fundamentals.md
+  - "Amazon S3 Introduction": amazon-s3-introduction.md
+  - "AWS CLI, SDK, IAM Roles & Policies": aws-cli-sdk-iam-roles-policies.md
+  - "Advanced Amazon S3": advanced-amazon-s3.md
+  - "Amazon S3 Security": amazon-s3-security.md

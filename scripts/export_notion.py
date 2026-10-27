@@ -377,18 +377,68 @@ def render_block(b, node, cur_path):
 
 
 def write_node(node):
+    for child in node["children"]:
+        write_node(child)
     path = node["path"]
-    lines = [f"# {escape(node['title'])}", ""]
     if node["kind"] == "database":
-        lines += [f"- [{escape(c['title'])}]({rel_link(path, c['path'])})" for c in node["children"]]
+        body = [f"- [{escape(c['title'])}]({rel_link(path, c['path'])})" for c in node["children"]]
     else:
-        lines += render_blocks(node["blocks"], node, path)
+        body = render_blocks(node["blocks"], node, path)
+    node["lectures"] = sum(1 for l in body if re.match(r"^## Lecture\b", l))
+    node["diagrams"] = sum(1 for l in body if re.match(r"^\s*```mermaid", l))
+    if path == "index.md":
+        lines = home_page(node, body)
+    else:
+        lines = [f"# {escape(node['title'])}", ""] + body
     full = os.path.join(DOCS, path)
     os.makedirs(os.path.dirname(full), exist_ok=True)
     with open(full, "w", encoding="utf-8", newline="\n") as f:
         f.write("\n".join(lines).rstrip() + "\n")
-    for child in node["children"]:
-        write_node(child)
+
+
+def home_page(root, body):
+    """Dashboard-style landing page: hero, stats grid, and a module table."""
+    modules = root["children"]
+    lectures = sum(m["lectures"] for m in modules)
+    diagrams = sum(m["diagrams"] for m in modules)
+    first = modules[0]["path"] if modules else "index.md"
+    stats = [
+        ("Modules", len(modules), "Sections exported from Notion"),
+        ("Lectures", lectures, "Course lectures covered"),
+        ("Diagrams", diagrams, "Architecture and flow diagrams"),
+        ("Exam", "DVA-C02", "AWS Certified Developer – Associate"),
+    ]
+    lines = [
+        "---", "hide:", "  - navigation", "  - toc", "---", "",
+        "# aws dva-c02 notes", "",
+        '<p class="page-subtitle">Revision notes for the AWS Certified Developer – Associate exam.</p>', "",
+        '<div class="home-workspace" markdown>', "",
+        '<div class="hero-panel" markdown>', "",
+        "## From the console to the exam room", "",
+        "Lecture-by-lecture notes across IAM, compute, storage, networking and databases. "
+        "Search with `/` or `s`, or start from the first module.", "",
+        f"[Start revising →]({first}){{ .md-button .md-button--primary }}", "",
+        "</div>", "",
+        '<div class="stats-grid">',
+    ]
+    for label, value, desc in stats:
+        lines.append(f'<div class="stat-box"><div class="stat-label">{label}</div>'
+                     f'<div class="stat-value">{value}</div><div class="stat-desc">{desc}</div></div>')
+    lines += [
+        "</div>", "",
+        '<div class="hero-panel" markdown>', "",
+        "## Modules", "",
+        "| # | Module | Lectures | Diagrams |",
+        "| --- | --- | --- | --- |",
+    ]
+    for i, m in enumerate(modules, 1):
+        lines.append(f"| {i:02d} | [{escape(m['title'])}]({m['path']}) | {m['lectures'] or '—'} | {m['diagrams'] or '—'} |")
+    lines += ["", "</div>", "", "</div>"]
+    # Keep any root-page content other than the links to subpages.
+    extra = [l for l in body if l and not re.match(r"^(📄|🗂️) \[", l)]
+    if extra:
+        lines += [""] + body
+    return lines
 
 
 def nav_entries(node):

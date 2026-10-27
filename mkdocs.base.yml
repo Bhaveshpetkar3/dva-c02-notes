@@ -3,16 +3,18 @@ docs_dir: docs
 
 theme:
   name: material
+  # Fonts are self-hosted in docs/assets/fonts (see stylesheets/extra.css).
+  font: false
   palette:
-    - media: "(prefers-color-scheme: dark)"
-      scheme: slate
-      primary: indigo
+    - scheme: slate
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-sunny
         name: Switch to light mode
-    - media: "(prefers-color-scheme: light)"
-      scheme: default
-      primary: indigo
+    - scheme: default
+      primary: custom
+      accent: custom
       toggle:
         icon: material/weather-night
         name: Switch to dark mode
@@ -32,6 +34,9 @@ plugins:
 # Bundled locally so diagrams render even where CDNs are blocked.
 extra_javascript:
   - js/mermaid.min.js
+
+extra_css:
+  - stylesheets/extra.css
 
 markdown_extensions:
   - admonition

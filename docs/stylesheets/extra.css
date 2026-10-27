@@ -220,6 +220,33 @@ body {
   font-size: 0.6rem;
 }
 
+/* ─── Collapsible sidebars (see js/sidebars.js) ─── */
+.sidebar-toggle {
+  display: none;
+  border: 1px solid var(--border-subtle);
+  border-radius: var(--radius);
+  padding: 0.2rem;
+  margin: 0 0.2rem;
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+.sidebar-toggle:hover {
+  background: var(--bg-tertiary);
+  border-color: var(--border-accent);
+  color: var(--text-primary);
+}
+.sidebar-toggle[aria-pressed="true"] { color: var(--text-faint); }
+
+/* Only where the sidebar is docked: left from 76.25em, right from 60em. */
+@media screen and (min-width: 76.25em) {
+  .sidebar-toggle--left { display: inline-block; }
+  .hide-left .md-sidebar--primary { display: none; }
+}
+@media screen and (min-width: 60em) {
+  .sidebar-toggle--right { display: inline-block; }
+  .hide-right .md-sidebar--secondary { display: none; }
+}
+
 /* ─── Content typography ─── */
 .md-typeset {
   font-size: 0.74rem;

@@ -34,6 +34,7 @@ plugins:
 # Bundled locally so diagrams render even where CDNs are blocked.
 extra_javascript:
   - js/mermaid.min.js
+  - js/sidebars.js
 
 extra_css:
   - stylesheets/extra.css

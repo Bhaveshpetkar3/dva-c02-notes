@@ -53,6 +53,11 @@
     });
   }
 
+  // Enable transitions only after the initial state has been painted.
+  requestAnimationFrame(function () {
+    requestAnimationFrame(function () { root.classList.add('sidebar-anim'); });
+  });
+
   document.addEventListener('keydown', function (e) {
     var t = e.target;
     if (e.ctrlKey || e.metaKey || e.altKey || (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName)))) return;

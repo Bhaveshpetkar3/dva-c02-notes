@@ -3,6 +3,7 @@ docs_dir: docs
 
 theme:
   name: material
+  custom_dir: overrides
   # Fonts are self-hosted in docs/assets/fonts (see stylesheets/extra.css).
   font: false
   palette:

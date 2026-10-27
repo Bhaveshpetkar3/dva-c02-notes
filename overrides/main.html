@@ -1,0 +1,11 @@
+{% extends "base.html" %}
+
+{% block extrahead %}
+  <!-- Apply saved sidebar state before first paint (toggles live in js/sidebars.js). -->
+  <script>
+    try {
+      if (localStorage.getItem("dva-hide-left") === "1") document.documentElement.classList.add("hide-left");
+      if (localStorage.getItem("dva-hide-right") === "1") document.documentElement.classList.add("hide-right");
+    } catch (e) {}
+  </script>
+{% endblock %}

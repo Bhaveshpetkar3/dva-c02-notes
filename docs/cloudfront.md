@@ -787,3 +787,172 @@ export const handler = async (event) => {
 - **Versioned file names** are the preferred alternative for frequently changing static assets.
 
 ---
+
+## Lecture 157: 🧭 CloudFront - Cache Behaviors
+
+> **Overview**: A **cache behavior** is a set of rules that CloudFront applies to requests whose URL matches a **path pattern** (`/images/*`, `/api/*`, `/login`). Each behavior picks its own **origin**, cache policy, allowed methods, viewer access restrictions and edge functions, so one distribution can serve static files from S3 and dynamic API calls from an ALB. Every distribution has a **default behavior** (`*`), which is always evaluated last and catches everything else.
+
+### 🧩 What a Cache Behavior Is
+
+- A distribution has **one or more origins** (S3 bucket, ALB, EC2, API Gateway, any HTTP server) and an **ordered list of cache behaviors**.
+- For every request, CloudFront compares the URL path against the behaviors **in order** and uses the **first match**.
+- The **default cache behavior** (`*`, shown in the console as "Default (*)") always exists, can't be deleted and is **always processed last**.
+- Behaviors let you treat different parts of the site differently: long caching for images, no caching for the API, authentication only for premium content.
+
+```mermaid
+graph LR
+    U["Users"] --> CF["CloudFront Distribution"]
+    CF -->|"/api/* (precedence 0)"| ALB["Application Load Balancer"]
+    CF -->|"/images/* (precedence 1)"| S3I["S3 Bucket (images)"]
+    CF -->|"Default (*)"| S3["S3 Bucket (static site)"]
+```
+
+### ⚙️ Settings You Can Set Per Behavior
+
+| Setting | What it controls | Typical choice |
+| --- | --- | --- |
+| **Path pattern** | Which URLs the behavior applies to | `/api/*`, `/images/*.jpg`, `/login` |
+| **Origin or origin group** | Where cache misses are sent | ALB for `/api/*`, S3 for static files |
+| **Viewer protocol policy** | HTTP and HTTPS, Redirect HTTP to HTTPS, or HTTPS only | Redirect HTTP to HTTPS |
+| **Allowed HTTP methods** | `GET, HEAD` / `GET, HEAD, OPTIONS` / all seven methods incl. `POST, PUT, PATCH, DELETE` | All methods for APIs, `GET, HEAD` for static |
+| **Cache policy** | TTLs and the cache key (headers, cookies, query strings) | `CachingOptimized` for static, `CachingDisabled` for APIs |
+| **Origin request policy** | Extra values forwarded to the origin without entering the cache key | `AllViewerExceptHostHeader` for APIs |
+| **Response headers policy** | Headers added to responses (CORS, security headers) | `SimpleCORS`, `SecurityHeadersPolicy` |
+| **Restrict viewer access** | Require **signed URLs or signed cookies** (trusted key groups) | On for premium content |
+| **Function associations** | CloudFront Functions or Lambda@Edge on viewer/origin request/response | URL rewrites, auth checks, header changes |
+| **Compress objects** | Automatic Gzip/Brotli | On |
+| **Real-time logs** | Send logs for this behavior to Kinesis Data Streams | Per behavior if needed |
+
+> **Important**: Because the cache policy is attached **per behavior**, the cache key can be different for each path. The API can forward the `Authorization` header and every query string while the images path caches on the URL only.
+
+### 🔀 Path Patterns and Precedence
+
+- Patterns are **case-sensitive** and may use `*` (zero or more characters) and `?` (exactly one character).
+- A leading `/` is optional: `images/*.jpg` and `/images/*.jpg` are the same.
+- Examples: `/images/*.jpg` (all JPEGs under images), `*.gif` (every GIF anywhere), `/api/v?/*` (`/api/v1/...`, `/api/v2/...`).
+- **Order matters**: put the **most specific** patterns first. If `/images/*` comes before `/images/thumbs/*`, the thumbs behavior is never used.
+- Behaviors have a **precedence number** (0 = evaluated first). You reorder them in the console (Behaviors tab, "Move up/down") or by changing the order in the distribution config.
+- Default quota: **25 cache behaviors per distribution** (adjustable).
+
+```mermaid
+flowchart TD
+    R["Request: GET /images/thumbs/cat.jpg"] --> B0{"Precedence 0: /images/thumbs/*"}
+    B0 -->|"Match"| T["Use thumbs behavior"]
+    B0 -->|"No match"| B1{"Precedence 1: /images/*"}
+    B1 -->|"Match"| I["Use images behavior"]
+    B1 -->|"No match"| D["Default behavior (*)"]
+```
+
+### 🔐 Pattern: Sign-In Page with Signed Cookies
+
+A common use of behaviors is protecting a whole site while leaving the login page open:
+
+- **`/login` behavior** → origin is an **EC2 instance or ALB** running the app; viewer access is **not restricted**, and caching is disabled.
+- **Default `*` behavior** → origin is the **S3 bucket** with the content; **Restrict viewer access** is on, so requests need valid **signed cookies**.
+- Flow: the user opens `/login`, authenticates, and the app returns **`Set-Cookie`** headers with CloudFront signed cookies. From then on, requests to `/*` carry the cookies and CloudFront serves the content.
+
+```mermaid
+sequenceDiagram
+    participant U as User
+    participant CF as CloudFront
+    participant EC2 as EC2 App (/login)
+    participant S3 as S3 Bucket (default)
+    U->>CF: GET /premium/video.mp4 without cookies
+    CF-->>U: 403 Forbidden
+    U->>CF: POST /login with credentials
+    CF->>EC2: Forward (login behavior, not restricted)
+    EC2-->>CF: 200 with Set-Cookie signed cookies
+    CF-->>U: Signed cookies stored in browser
+    U->>CF: GET /premium/video.mp4 with cookies
+    CF->>S3: Cache miss, fetch via OAC
+    S3-->>CF: Object
+    CF-->>U: Content
+```
+
+### ⚡ Pattern: Separate Static and Dynamic Content
+
+- **Static content** (S3): no headers, no cookies, no session data in the cache key → very high cache hit ratio.
+- **Dynamic content** (ALB + EC2, API Gateway, Lambda function URLs): the cache key and forwarded values include only the headers, cookies and query strings the app really needs, or caching is disabled.
+- Mixing them in one behavior with "forward all headers and cookies" makes every request unique, so nothing gets cached. Splitting them by path (or into two distributions) is how you **maximise cache hits**.
+
+### 💻 CLI and SDK: Adding a Behavior
+
+Cache behaviors are part of the **distribution config**, so you change them with `UpdateDistribution`. The update replaces the whole config and needs the current **ETag** (optimistic locking).
+
+```bash
+# 1. Get the current config and its ETag
+aws cloudfront get-distribution-config --id EDFDVBD6EXAMPLE > dist.json
+
+# 2. Copy DistributionConfig into new-config.json, add an /api/* entry
+#    to CacheBehaviors.Items and update CacheBehaviors.Quantity
+
+# 3. Push the full config back, passing the ETag from step 1
+aws cloudfront update-distribution --id EDFDVBD6EXAMPLE \
+  --if-match E2QWRUHEXAMPLE \
+  --distribution-config file://new-config.json
+```
+
+```javascript
+import {
+  CloudFrontClient,
+  GetDistributionConfigCommand,
+  UpdateDistributionCommand,
+} from "@aws-sdk/client-cloudfront";
+
+const cf = new CloudFrontClient({ region: "us-east-1" });
+const Id = "EDFDVBD6EXAMPLE";
+
+const { DistributionConfig, ETag } = await cf.send(new GetDistributionConfigCommand({ Id }));
+
+const apiBehavior = {
+  PathPattern: "/api/*",
+  TargetOriginId: "my-alb-origin", // must match an Id in DistributionConfig.Origins
+  ViewerProtocolPolicy: "https-only",
+  AllowedMethods: {
+    Quantity: 7,
+    Items: ["GET", "HEAD", "OPTIONS", "PUT", "PATCH", "POST", "DELETE"],
+    CachedMethods: { Quantity: 2, Items: ["GET", "HEAD"] },
+  },
+  CachePolicyId: "4135ea2d-6df8-44a3-9df3-4b5a84be39ad", // managed CachingDisabled
+  OriginRequestPolicyId: "b689b0a8-53d0-40ab-baf2-68738e2966ac", // managed AllViewerExceptHostHeader
+  Compress: true,
+};
+
+// Most specific first: put the new behavior at the front of the list
+const items = [apiBehavior, ...(DistributionConfig.CacheBehaviors.Items ?? [])];
+DistributionConfig.CacheBehaviors = { Quantity: items.length, Items: items };
+
+await cf.send(new UpdateDistributionCommand({ Id, IfMatch: ETag, DistributionConfig }));
+```
+
+- If someone else changed the distribution after your `Get`, the update fails with **`PreconditionFailed`** (stale ETag); fetch again and retry.
+- Changes propagate to all edge locations in a few minutes; the distribution status goes `InProgress` → `Deployed`.
+- Required permissions: `cloudfront:GetDistributionConfig` and `cloudfront:UpdateDistribution`.
+
+### 🛠️ In Practice
+
+- A standard SPA layout: default `*` → S3 with `CachingOptimized`; `/api/*` → ALB or API Gateway with `CachingDisabled` and `AllViewerExceptHostHeader`. The browser calls the API on the **same domain**, so you avoid CORS entirely.
+- CloudFront forwards the **full path** to the origin. A request to `/api/users` reaches the ALB as `/api/users`, not `/users`; the backend must expect the prefix, or a CloudFront Function must rewrite it.
+- When a path "isn't working", check precedence first: an earlier, broader pattern (`*.js`, `/static/*`) often swallows the request. The `X-Cache` response header shows whether the request hit the cache.
+- Manage distributions as code (CloudFormation `AWS::CloudFront::Distribution`, CDK, SAM). Hand-editing the full config through the API is error-prone.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Route `/api/*` to an ALB and everything else to S3 behind one domain"** → multiple origins + **cache behaviors** by path pattern.
+- **"Different caching/TTL for different file types or paths"** → separate cache behaviors, each with its own **cache policy**.
+- **"Protect all content except the login page"** → `/login` behavior without restrictions, default behavior with **signed cookies** (trusted key group).
+- **"Maximise cache hit ratio for a site with static and dynamic content"** → split static and dynamic into separate behaviors (or distributions); keep the static cache key minimal.
+- The **default behavior is `*`** and is evaluated **last**; patterns are matched in precedence order, first match wins.
+- A behavior that only allows `GET, HEAD` rejects `POST` with a **403**; APIs need all methods allowed.
+- Don't confuse **cache behaviors** (path-based routing inside CloudFront) with **origin groups** (primary/secondary failover origins). A behavior can point to an origin group.
+
+### 📝 Key Exam Takeaways
+
+- **Cache behaviors** apply settings per **URL path pattern** and can route each pattern to a **different origin or origin group**.
+- The **default cache behavior** (`*`) always exists and is **processed last**; more specific patterns get lower precedence numbers.
+- Per-behavior settings include origin, viewer protocol policy, allowed methods, cache and origin request policies, signed URL/cookie restriction and edge functions.
+- Classic patterns: `/api/*` → ALB, `/*` → S3; `/login` open, the rest protected by **signed cookies**.
+- Separating **static** and **dynamic** content maximises cache hits.
+- Behaviors are changed through `UpdateDistribution` with the config's **ETag** (`IfMatch`).
+
+---

@@ -78,3 +78,4 @@ nav:
   - "AWS CLI, SDK, IAM Roles & Policies": aws-cli-sdk-iam-roles-policies.md
   - "Advanced Amazon S3": advanced-amazon-s3.md
   - "Amazon S3 Security": amazon-s3-security.md
+  - "CloudFront": cloudfront.md

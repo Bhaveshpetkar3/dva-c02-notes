@@ -956,3 +956,222 @@ await cf.send(new UpdateDistributionCommand({ Id, IfMatch: ETag, DistributionCon
 - Behaviors are changed through `UpdateDistribution` with the config's **ETag** (`IfMatch`).
 
 ---
+
+## Lecture 158: 🧪 CloudFront - Caching & Caching Invalidations - Hands On
+
+> **Overview**: This hands-on goes back to the distribution from Lecture 154 (private S3 bucket + OAC) and tours the **Policies** pages: managed and custom **cache policies**, **origin request policies** and **response headers policies**, and how they attach to a **cache behavior**. You then change `index.html` at the origin, prove that CloudFront keeps serving the **stale cached copy**, and fix it with a **cache invalidation**.
+
+### 🎯 What You Do
+
+```mermaid
+flowchart LR
+    A["Explore cache and origin request policies"] --> B["Attach policies to a cache behavior"]
+    B --> C["Update index.html in S3"]
+    C --> D["Browser still shows the old page (cache hit)"]
+    D --> E["Create invalidation /index.html or /*"]
+    E --> F["Next request is a miss and fetches the new page"]
+```
+
+- **Starting point**: the distribution from Lecture 154 (default behavior → private S3 bucket, cache policy `CachingOptimized`, default root object `index.html`).
+- **Files**: `index.html`, `coffee.jpg` and `beach.jpg` from the course `code/s3/` folder.
+
+### 🪜 Step 1: Explore the Cache Policies
+
+**CloudFront console → Policies → Cache** tab. You see two lists: **Managed policies** (provided by AWS, read-only) and **Custom policies** (yours).
+
+| Managed cache policy | What it does | Typical use |
+| --- | --- | --- |
+| `CachingOptimized` | No headers, cookies or query strings in the key; TTLs min 1 s, default 1 day, max 1 year; Gzip and Brotli on | Static content from S3 (the default) |
+| `CachingOptimizedForUncompressedObjects` | Same, but without the compression settings | Origins that serve pre-compressed or binary files |
+| `CachingDisabled` | All TTLs 0, nothing cached | APIs and per-user dynamic content |
+| `UseOriginCacheControlHeaders` | Honours the origin's `Cache-Control`/`Expires`; host header in the key | Origins that set their own caching headers |
+| `UseOriginCacheControlHeaders-QueryStrings` | As above, plus all query strings in the key | Dynamic origins whose output varies by query string |
+| `Amplify`, `Elemental-MediaPackage` | Tuned for those services | Amplify Hosting, video streaming |
+
+Then **Create cache policy** to see every option you can control:
+
+- **TTL settings**: minimum, default and maximum TTL (0 seconds to 1 year). The **default TTL** applies when the origin sends no `Cache-Control` or `Expires` header; min and max **clamp** whatever the origin asks for.
+- **Cache key settings**:
+    - **Headers**: None or Include the following headers (whitelist).
+    - **Query strings**: None, Include specified, All except, All.
+    - **Cookies**: None, Include specified, All except, All.
+- **Compression support**: Gzip and Brotli (adds the normalised `Accept-Encoding` to the key).
+
+> **Important**: Everything you add to the cache key is **also forwarded to the origin** automatically. You never need to repeat it in the origin request policy.
+
+The same custom policy from the CLI, caching on the `size` query string only:
+
+```json
+{
+  "Name": "images-by-size",
+  "Comment": "Cache images per size query string",
+  "MinTTL": 1,
+  "DefaultTTL": 86400,
+  "MaxTTL": 31536000,
+  "ParametersInCacheKeyAndForwardedToOrigin": {
+    "EnableAcceptEncodingGzip": true,
+    "EnableAcceptEncodingBrotli": true,
+    "HeadersConfig": { "HeaderBehavior": "none" },
+    "CookiesConfig": { "CookieBehavior": "none" },
+    "QueryStringsConfig": {
+      "QueryStringBehavior": "whitelist",
+      "QueryStrings": { "Quantity": 1, "Items": ["size"] }
+    }
+  }
+}
+```
+
+```bash
+aws cloudfront create-cache-policy --cache-policy-config file://images-by-size.json
+
+# List only your own policies (use --type managed to see the AWS ones and their IDs)
+aws cloudfront list-cache-policies --type custom
+```
+
+### 🪜 Step 2: Origin Request and Response Headers Policies
+
+**Policies → Origin request** tab. These policies forward values to the origin **without** adding them to the cache key.
+
+| Managed origin request policy | Forwards |
+| --- | --- |
+| `AllViewer` | Every viewer header, cookie and query string |
+| `AllViewerExceptHostHeader` | Everything except `Host` (needed for API Gateway and Lambda function URL origins, which expect their own hostname) |
+| `AllViewerAndCloudFrontHeaders-2022-06` | Everything plus CloudFront headers such as `CloudFront-Viewer-Country` |
+| `CORS-S3Origin` | `Origin`, `Access-Control-Request-Method`, `Access-Control-Request-Headers` |
+| `CORS-CustomOrigin` | `Origin` only |
+| `UserAgentRefererHeaders` | `User-Agent` and `Referer` |
+
+- A custom origin request policy can also add **CloudFront-generated headers** (viewer country, device type, viewer address) that the viewer never sent.
+- **Policies → Response headers** tab: managed policies such as `SimpleCORS`, `CORS-With-Preflight` and `SecurityHeadersPolicy` add headers to the response on the way back to the viewer, without touching the origin.
+
+### 🪜 Step 3: Attach the Policies to a Behavior
+
+1. Open the distribution → **Behaviors** tab → select **Default (*)** → **Edit**.
+2. Under **Cache key and origin requests**, choose **Cache policy and origin request policy (recommended)**. The older **Legacy cache settings** option still exists but is not the recommended path.
+3. Pick a **cache policy** (keep `CachingOptimized` for this S3 site), optionally an **origin request policy** and a **response headers policy**.
+4. **Save changes**. The distribution goes to **Deploying** for a few minutes.
+
+> **Exam Tip**: Policies are reusable objects attached **per cache behavior**. One distribution can use `CachingOptimized` on `*` and `CachingDisabled` on `/api/*`.
+
+### 🪜 Step 4: Update the Origin and See Stale Content
+
+1. Load `https://d1a2b3c4d5e6f7.cloudfront.net/` so the page is cached at your edge location.
+2. Edit `index.html` locally: change the heading from "I really love coffee" to something new and switch the image from `coffee.jpg` to `beach.jpg`.
+3. Upload the new `index.html` to the bucket (same key, overwrite).
+4. Reload the CloudFront URL. You still see the **old page**: the edge has a valid cached copy and does not check S3 for changes.
+
+```bash
+BUCKET=demo-cloudfront-bp-2026
+CF=d1a2b3c4d5e6f7.cloudfront.net
+
+aws s3 cp index.html s3://$BUCKET/index.html
+
+# Still served from the edge cache: X-Cache is a hit and Age keeps growing
+curl -sI https://$CF/ | grep -i -E "x-cache|^age"
+
+# The bucket really has the new version (read it with your IAM credentials)
+aws s3 cp s3://$BUCKET/index.html - | grep h1
+```
+
+- With `CachingOptimized` and no `Cache-Control` on the S3 object, the **default TTL of 24 hours** applies, so without action users could see the old page for up to a day.
+- Test with `curl` or a private window. A normal browser reload can also show a **browser-cached** copy, which confuses the result.
+
+### 🪜 Step 5: Create the Invalidation
+
+1. Distribution → **Invalidations** tab → **Create invalidation**.
+2. **Add object paths**: `/index.html` (just the changed file) or `/*` (everything). One path per line, each starting with `/`.
+3. **Create invalidation**. Status shows **In progress**, then **Completed**, usually within a minute.
+4. Reload the CloudFront URL: you now see the **new heading and the beach image**. `curl` shows `Miss from cloudfront` once, then hits again.
+
+```bash
+ID=$(aws cloudfront create-invalidation \
+  --distribution-id EDFDVBD6EXAMPLE \
+  --paths "/index.html" \
+  --query Invalidation.Id --output text)
+
+aws cloudfront wait invalidation-completed --distribution-id EDFDVBD6EXAMPLE --id "$ID"
+
+curl -sI https://$CF/ | grep -i x-cache   # Miss from cloudfront, then Hit on the next call
+```
+
+> **Important**: With a **default root object**, the root URL and the file itself can be cached under different keys. Invalidate both `/` and `/index.html` (two paths), or use `/*`, which clears everything and still counts as **one path**.
+
+### 🧑‍💻 Deploy and Invalidate from Node.js
+
+A deploy script does steps 4 and 5 together: upload, invalidate, wait.
+
+```javascript
+import { readFile } from "node:fs/promises";
+import { S3Client, PutObjectCommand } from "@aws-sdk/client-s3";
+import {
+  CloudFrontClient,
+  CreateInvalidationCommand,
+  waitUntilInvalidationCompleted,
+} from "@aws-sdk/client-cloudfront";
+
+const s3 = new S3Client({ region: "us-east-1" });
+const cf = new CloudFrontClient({ region: "us-east-1" });
+const DistributionId = "EDFDVBD6EXAMPLE";
+
+await s3.send(
+  new PutObjectCommand({
+    Bucket: "demo-cloudfront-bp-2026",
+    Key: "index.html",
+    Body: await readFile("index.html"),
+    ContentType: "text/html",
+    CacheControl: "max-age=60", // short TTL for the entry point (within the policy's min/max)
+  })
+);
+
+const { Invalidation } = await cf.send(
+  new CreateInvalidationCommand({
+    DistributionId,
+    InvalidationBatch: {
+      CallerReference: `deploy-${Date.now()}`,
+      Paths: { Quantity: 2, Items: ["/", "/index.html"] },
+    },
+  })
+);
+
+await waitUntilInvalidationCompleted(
+  { client: cf, maxWaitTime: 600 },
+  { DistributionId, Id: Invalidation.Id }
+);
+console.log("Invalidation", Invalidation.Id, "completed");
+```
+
+- IAM permissions: `s3:PutObject` on the bucket, `cloudfront:CreateInvalidation` and `cloudfront:GetInvalidation` (used by the waiter) on the distribution.
+- Setting `Cache-Control` on the object lets the origin pick the TTL; the cache policy's min and max TTL still clamp it.
+
+### 🧹 Clean Up
+
+- Custom cache and origin request policies can only be deleted once **no behavior uses them** (`aws cloudfront delete-cache-policy --id ... --if-match <ETag>`).
+- Invalidations need no clean-up; they are kept in the history automatically.
+- If you are done with CloudFront, follow the Lecture 154 order: **disable → wait → delete distribution → delete OAC → empty and delete bucket**.
+
+### 🛠️ In Practice
+
+- Prefer **managed policies** unless you need something specific; they are tested, documented and referenced by stable IDs in CloudFormation/CDK.
+- Keep the cache key minimal. A whitelist of one query string beats "All", and adding `User-Agent` or all cookies to the key usually destroys the hit ratio.
+- Give fingerprinted assets (`app.3f9a1c.js`) a long `Cache-Control: max-age=31536000, immutable` and the entry point (`index.html`) a short TTL or an invalidation on each deploy.
+- Debug caching with response headers: `X-Cache` (Hit, Miss, RefreshHit, Error), `Age`, and `Cache-Control` from the origin. The distribution's **cache statistics** and **popular objects** reports show hit ratio over time.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Changed a file in S3 but CloudFront still serves the old one"** → content is cached until the TTL ends; run a **CreateInvalidation** (or use versioned filenames).
+- **"Cache content per query string / header / cookie"** → put it in the **cache policy**; **"origin needs a value but caching should not vary on it"** → **origin request policy**.
+- **"Don't cache API responses"** → `CachingDisabled` on that behavior.
+- **"Origin controls how long objects stay cached"** → `Cache-Control: max-age` / `s-maxage` or `Expires` from the origin, bounded by the policy's **min and max TTL**; the **default TTL** applies when the origin sends nothing.
+- **"API Gateway or Lambda function URL origin returns 403 through CloudFront"** → forwarding the viewer `Host` header; use `AllViewerExceptHostHeader`.
+- Invalidation is per distribution and covers **all edge locations**; it doesn't clear **browser** caches.
+
+### 📝 Key Exam Takeaways
+
+- **Cache policies** set the TTLs and the cache key (headers, cookies, query strings); managed ones include `CachingOptimized` and `CachingDisabled`.
+- **Origin request policies** forward extra values to the origin **without** changing the cache key; **response headers policies** add headers to responses.
+- Policies are attached **per cache behavior** (Behaviors tab → Edit).
+- Updating an object at the origin does **not** refresh CloudFront; users get the cached copy until the TTL expires.
+- **Invalidations tab → Create invalidation** with `/index.html` or `/*` forces the refresh; CLI `aws cloudfront create-invalidation`, then `wait invalidation-completed`.
+- Verify with `X-Cache` and `Age` headers, using `curl` or a private window to rule out the browser cache.
+
+---

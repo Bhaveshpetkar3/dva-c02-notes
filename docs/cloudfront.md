@@ -1175,3 +1175,256 @@ console.log("Invalidation", Invalidation.Id, "completed");
 - Verify with `X-Cache` and `Age` headers, using `curl` or a private window to rule out the browser cache.
 
 ---
+
+## Lecture 159: 🏗️ CloudFront - ALB/EC2 as an Origin
+
+> **Overview**: CloudFront isn't only for S3. It can sit in front of an **Application Load Balancer**, **Network Load Balancer** or **EC2 instances** and cache or accelerate their responses. There are two ways to connect them: **VPC Origins**, where the ALB/NLB/EC2 stays in a **private subnet** and is never exposed to the internet (the recommended option), and the older **public network** approach, where the origin must be public and you lock it down with security groups that only allow CloudFront.
+
+### 🧭 Origin Types Recap
+
+| Origin type | What it is | How it's secured |
+| --- | --- | --- |
+| **S3 bucket** | Static files, uploads through CloudFront | **Origin Access Control (OAC)** + bucket policy |
+| **VPC Origin** | **Private** ALB, NLB or EC2 instance in a private subnet | No internet exposure; security group allows only CloudFront traffic |
+| **Custom origin (HTTP)** | Public ALB, EC2 public IP, S3 **website** endpoint, API Gateway, any public HTTP server | Security groups / prefix list, secret custom header, HTTPS |
+
+> **Important**: An **S3 static website endpoint** counts as a **custom (HTTP) origin**, not an S3 origin, so OAC doesn't apply to it. Use the bucket's REST endpoint if you want OAC.
+
+### 🔒 Option 1: VPC Origins (Private Subnets)
+
+- CloudFront connects **directly into your VPC** to a private ALB, NLB or EC2 instance. The app needs **no public IP and no internet-facing load balancer**.
+- CloudFront becomes the **only way in**, so nobody can skip the CDN (and AWS WAF, geo restriction, signed URLs) by calling the origin directly.
+- Setup: **CloudFront console → VPC origins → Create VPC origin** → choose the ARN of the private ALB, NLB or EC2 instance, the protocol and ports → wait until it is **Deployed** → select it as the origin of a distribution.
+- The origin's **security group** must allow inbound traffic from CloudFront. The simplest rule uses the AWS-managed prefix list **`com.amazonaws.global.cloudfront.origin-facing`**.
+- The VPC still needs an **internet gateway** attached, even though the origin itself sits in a private subnet with no public route.
+- VPC origins have no extra charge; normal CloudFront pricing applies.
+
+```mermaid
+graph LR
+    U["Users"] --> E["CloudFront Edge Location"]
+    subgraph VPC["VPC"]
+        subgraph PS["Private Subnet"]
+            ALB["Private ALB"]
+            NLB["Private NLB"]
+            EC2["EC2 Instance"]
+        end
+    end
+    E -->|"VPC Origin"| ALB
+    E -->|"VPC Origin"| NLB
+    E -->|"VPC Origin"| EC2
+```
+
+### 🌐 Option 2: Public Network (Classic Approach)
+
+Before VPC origins, CloudFront could only reach these origins over the **public internet**. This setup is still common and still appears on the exam.
+
+- **EC2 as origin**: the instance must be **public** (public IP or Elastic IP). Its security group allows the **public IP ranges of the CloudFront edge locations**.
+- **ALB as origin**: the **ALB must be public** (internet-facing) and its security group allows the edge location IPs. The **EC2 instances behind it can be private**, with a security group that only allows the **ALB's security group**.
+- AWS publishes CloudFront's IP ranges (in `ip-ranges.json`, service `CLOUDFRONT`), but the easiest way to use them in a security group is the managed prefix list **`com.amazonaws.global.cloudfront.origin-facing`**, which AWS keeps up to date.
+
+```mermaid
+graph LR
+    U["Users"] --> E["Edge Location (public IPs)"]
+    E -->|"SG allows CloudFront prefix list"| ALB["Public ALB"]
+    ALB -->|"SG allows ALB security group"| I1["Private EC2 Instances"]
+    E -->|"SG allows CloudFront prefix list"| P["Public EC2 Instance"]
+```
+
+> **Important**: Allowing only CloudFront's IPs stops random internet traffic, but **every** CloudFront distribution (including someone else's) uses those IPs. To prove a request came from **your** distribution, add a **custom origin header** (e.g. `X-Origin-Verify` with a secret value) in CloudFront and have an **ALB listener rule** or AWS WAF reject requests without it. VPC origins avoid this problem entirely.
+
+### ⚙️ Custom Origin Settings Worth Knowing
+
+| Setting | Meaning | Default / range |
+| --- | --- | --- |
+| **Protocol** (origin protocol policy) | HTTP only, HTTPS only, or Match viewer | HTTPS only for production |
+| **HTTP / HTTPS port** | Port on the origin | 80 / 443 |
+| **Minimum origin SSL protocol** | TLS version used to the origin | TLSv1.2 recommended |
+| **Response timeout** | How long CloudFront waits for the origin's response | 30 s default, 1–60 s (more by quota request) |
+| **Connection attempts / timeout** | Retries, and wait per attempt, before an error or origin failover | 3 attempts, 10 s |
+| **Keep-alive timeout** | How long idle connections to the origin are reused | 5 s default, up to 60 s |
+| **Custom headers** | Static headers added to every origin request | Used for the secret header pattern |
+
+- For **HTTPS to an ALB**, the ALB needs a certificate (ACM in the **ALB's region**) whose name matches the origin domain CloudFront connects to. The **viewer** certificate on the distribution is a separate ACM certificate that must be in **us-east-1**.
+- Typical errors: **502 Bad Gateway** (TLS handshake failure, certificate name mismatch, origin refused the connection) and **504 Gateway Timeout** (origin too slow, or the security group blocks CloudFront).
+
+### 💻 CLI: Lock an ALB Security Group to CloudFront
+
+```bash
+# Find the ID of the managed prefix list for CloudFront origin-facing IPs
+PL=$(aws ec2 describe-managed-prefix-lists \
+  --filters Name=prefix-list-name,Values=com.amazonaws.global.cloudfront.origin-facing \
+  --query "PrefixLists[0].PrefixListId" --output text)
+
+# Allow HTTPS from CloudFront only on the ALB security group
+aws ec2 authorize-security-group-ingress \
+  --group-id sg-0123456789abcdef0 \
+  --ip-permissions "IpProtocol=tcp,FromPort=443,ToPort=443,PrefixListIds=[{PrefixListId=$PL}]"
+```
+
+- The prefix list holds many CIDRs and counts as many rules against the security group's rule quota, so you may need a quota increase or a dedicated security group.
+
+### 🧑‍💻 Node.js: Create a VPC Origin
+
+```javascript
+import { CloudFrontClient, CreateVpcOriginCommand } from "@aws-sdk/client-cloudfront";
+
+const cf = new CloudFrontClient({ region: "us-east-1" });
+
+const { VpcOrigin } = await cf.send(
+  new CreateVpcOriginCommand({
+    VpcOriginEndpointConfig: {
+      Name: "private-app-alb",
+      Arn: "arn:aws:elasticloadbalancing:eu-west-1:123456789012:loadbalancer/app/private-app/50dc6c495c0c9188",
+      HTTPPort: 80,
+      HTTPSPort: 443,
+      OriginProtocolPolicy: "https-only",
+    },
+  })
+);
+
+console.log(VpcOrigin.Id, VpcOrigin.Status); // Deploying, then Deployed
+// Then reference it in the distribution origin: VpcOriginConfig: { VpcOriginId: VpcOrigin.Id }
+```
+
+### 🛠️ In Practice
+
+- For new apps, prefer **VPC origins**: internal ALB, private subnets, no public endpoints, AWS WAF on the distribution. This is simpler and safer than IP allowlists plus secret headers.
+- If you must use a public ALB, combine the **prefix list** with a **secret custom header** checked by an ALB listener rule, and rotate the header value from time to time.
+- Put the ALB behind a **`/api/*` behavior with `CachingDisabled`**. CloudFront still helps uncached traffic: TLS ends at an edge close to the user and requests travel over the AWS backbone.
+- For 502/504 errors, check in this order: security group allows CloudFront, origin protocol and port, certificate name on the ALB, then response timeout versus how long the app takes.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Serve an app in private subnets through CloudFront without exposing it to the internet"** → **CloudFront VPC origins** (private ALB / NLB / EC2).
+- **"EC2 directly as a custom origin over the internet"** → the instance must be **public**; its security group allows **CloudFront edge IPs**.
+- **"ALB as origin, instances private"** → public ALB with a security group allowing CloudFront IPs; instances' security group allows only the **ALB security group**.
+- **"Users must not bypass CloudFront and hit the ALB directly"** → VPC origin, or prefix list + **custom header** validated at the ALB or WAF.
+- **OAC is for S3** (and a few other AWS origins such as Lambda function URLs), not for ALB/EC2. S3 **website** endpoints are custom origins.
+- Viewer certificate for CloudFront → ACM in **us-east-1**; origin certificate on the ALB → ACM in the ALB's region.
+
+### 📝 Key Exam Takeaways
+
+- CloudFront origins: **S3** (with OAC), **VPC origins** (private ALB/NLB/EC2) and **custom HTTP origins** (public ALB, EC2, S3 website, any HTTP server).
+- **VPC origins** keep the ALB/NLB/EC2 in **private subnets**; CloudFront is the only entry point.
+- **Public network** approach: EC2 must be public; with an ALB, the ALB is public and the instances can be private.
+- Restrict the origin's security group to CloudFront with the edge IP ranges or the managed prefix list `com.amazonaws.global.cloudfront.origin-facing`.
+- Add a **secret custom header** to prove requests came from your distribution when the origin is public.
+- 502 usually means a TLS or connection problem at the origin; 504 means a timeout or a security group blocking CloudFront.
+
+---
+
+## Lecture 160: 🗺️ CloudFront - Geo Restriction
+
+> **Overview**: **Geo restriction** (also called geoblocking) controls which **countries** can access a CloudFront distribution, using either an **allowlist** of approved countries or a **blocklist** of banned ones. CloudFront finds the viewer's country with a third-party **Geo-IP database** and returns **403 Forbidden** to blocked viewers. The usual reason is **copyright and licensing**: content you may only distribute in certain countries.
+
+### 🌍 How It Works
+
+- You configure it once **per distribution**; it applies to every cache behavior and every object in that distribution.
+- Two modes:
+    - **Allowlist**: only viewers from the listed countries get the content.
+    - **Blocklist**: everyone except viewers from the listed countries gets the content.
+- The country is derived from the viewer's **IP address** using a third-party Geo-IP database (AWS quotes about 99.8% accuracy). If CloudFront can't determine the country, it serves the content.
+- Countries are identified by **ISO 3166-1 alpha-2 codes** (`US`, `GB`, `IN`, `DE`).
+- Blocked viewers get HTTP **403 Forbidden**. You can attach a **custom error page** for 403 (e.g. "This content is not available in your country").
+
+```mermaid
+flowchart TD
+    V["Viewer request"] --> G["CloudFront looks up the country from the IP (Geo-IP database)"]
+    G --> C{"Country allowed?"}
+    C -->|"Yes (in allowlist / not in blocklist)"| S["Serve from cache or origin"]
+    C -->|"No"| F["403 Forbidden (optional custom error page)"]
+```
+
+| Mode | `RestrictionType` in the API | Use when |
+| --- | --- | --- |
+| No restriction | `none` | Default |
+| Allowlist | `whitelist` | Content licensed only in a few countries |
+| Blocklist | `blacklist` | Content available everywhere except a few countries |
+
+### 🧪 Hands On: Enable Geo Restriction
+
+1. **CloudFront console** → open the distribution → **Security** tab → **CloudFront geographic restrictions** → **Countries** → **Edit** (older console layouts have a **Geographic restrictions** tab instead).
+2. Choose **Allow list** or **Block list**.
+3. Add the countries (e.g. block **India**, or allow only **United States** and **Canada**) and **Save changes**.
+4. Wait until the distribution status is **Deployed** again (a few minutes).
+5. Test from a blocked country (or through a VPN): you get a **403** error page from CloudFront. From an allowed country the site loads normally.
+6. **Clean up**: set the restriction back to **No restrictions** so the demo distribution keeps working for later lectures.
+
+```bash
+# Show the current geo restriction of a distribution
+aws cloudfront get-distribution-config --id EDFDVBD6EXAMPLE \
+  --query "DistributionConfig.Restrictions"
+```
+
+```json
+{
+  "GeoRestriction": {
+    "RestrictionType": "whitelist",
+    "Quantity": 2,
+    "Items": ["US", "CA"]
+  }
+}
+```
+
+### 🧑‍💻 Node.js: Switch On an Allowlist
+
+```javascript
+import {
+  CloudFrontClient,
+  GetDistributionConfigCommand,
+  UpdateDistributionCommand,
+} from "@aws-sdk/client-cloudfront";
+
+const cf = new CloudFrontClient({ region: "us-east-1" });
+const Id = "EDFDVBD6EXAMPLE";
+
+const { DistributionConfig, ETag } = await cf.send(new GetDistributionConfigCommand({ Id }));
+
+DistributionConfig.Restrictions = {
+  GeoRestriction: {
+    RestrictionType: "whitelist", // "blacklist" for a blocklist, "none" to remove it
+    Quantity: 2,
+    Items: ["US", "CA"],
+  },
+};
+
+await cf.send(new UpdateDistributionCommand({ Id, IfMatch: ETag, DistributionConfig }));
+```
+
+- Same pattern as any distribution change: send the full config plus the current **ETag** in `IfMatch`, or the call fails with `PreconditionFailed`.
+
+### 🔍 When Built-in Geo Restriction Isn't Enough
+
+| Need | Use |
+| --- | --- |
+| Allow or block whole countries for the whole distribution | **CloudFront geo restriction** |
+| Different rules per path, or country combined with other conditions (IP, rate) | **AWS WAF** web ACL with a **geo match** rule on the distribution |
+| Finer than country (region, city), or different content per country | **Lambda@Edge / CloudFront Functions** reading the `CloudFront-Viewer-Country` header (and related geo headers), or the app itself |
+| Origin needs to know the viewer's country | Forward **`CloudFront-Viewer-Country`** with an origin request policy |
+
+### 🛠️ In Practice
+
+- Geo restriction is a **compliance** control, not strong security: VPNs and proxies get around it. Treat it as a best effort to honour licensing.
+- Add a friendly **403 custom error page**, and keep its error caching TTL short so a misconfiguration doesn't stick at the edge.
+- If you need per-path rules or logs of blocked requests, use **AWS WAF geo match**; WAF metrics and logs show what was blocked.
+- To **personalise** by country (prices, language) rather than block, use the `CloudFront-Viewer-Country` header and include it in the cache key, so each country gets its own cached copy.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Content may only be shown in certain countries (copyright, licensing)"** → **CloudFront geo restriction** with an **allowlist**.
+- **"Block access from specific countries"** → geo restriction **blocklist** (or WAF geo match if you need more rules).
+- Blocked viewers get **403 Forbidden**; customise it with a **custom error response**.
+- Geo restriction applies to the **whole distribution**; per-path or combined conditions → **AWS WAF**.
+- Don't confuse it with **Route 53 geolocation routing**, which sends users to **different endpoints** by location. CloudFront geo restriction **allows or denies** access to one distribution.
+- The country comes from a **third-party Geo-IP database** using the viewer's IP.
+
+### 📝 Key Exam Takeaways
+
+- CloudFront **geo restriction** controls access by **country**: **allowlist** (only these) or **blocklist** (all except these).
+- The country is determined from the viewer IP with a **3rd-party Geo-IP database**.
+- Main use case: **copyright and licensing laws**.
+- Applies to the **entire distribution**; denied viewers receive **HTTP 403**.
+- Configured in the distribution's `Restrictions.GeoRestriction` (`whitelist`, `blacklist`, `none`).
+- For finer control use **AWS WAF geo match** or edge functions with the `CloudFront-Viewer-Country` header.
+
+---

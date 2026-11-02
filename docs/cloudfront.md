@@ -1428,3 +1428,219 @@ await cf.send(new UpdateDistributionCommand({ Id, IfMatch: ETag, DistributionCon
 - For finer control use **AWS WAF geo match** or edge functions with the `CloudFront-Viewer-Country` header.
 
 ---
+
+## Lecture 161: 🔏 CloudFront Signed URL / Cookies
+
+> **Overview**: **CloudFront signed URLs and signed cookies** let you serve **private or paid content** through CloudFront only to users your application has authorised. Your app signs a **policy** (expiry, and optionally start time, IP range and path) with a private key; CloudFront checks the signature with the matching public key at the edge. A **signed URL** grants access to **one file**, a **signed cookie** to **many files** at once.
+
+### 🎬 The Problem It Solves
+
+- You distribute **premium content** (videos, courses, software downloads, reports) worldwide through CloudFront for speed and caching.
+- The content must **not** be public: only logged-in or paying users should get it, and only for a limited time.
+- Two locks are needed together:
+    - **Viewer side**: the cache behavior is set to **Restrict viewer access**, so CloudFront rejects any request without a valid signature (**403 Forbidden**).
+    - **Origin side**: the S3 bucket is private and reachable only through CloudFront with **Origin Access Control (OAC)**, so nobody can bypass CloudFront and hit S3 directly.
+
+### 📜 What Goes in the Policy
+
+Every signed URL or cookie carries a policy that CloudFront enforces:
+
+| Condition | Meaning | Canned policy | Custom policy |
+| --- | --- | --- | --- |
+| `DateLessThan` | Expiry date and time (required) | Yes | Yes |
+| `DateGreaterThan` | Not valid before this time | No | Yes |
+| `IpAddress` (`AWS:SourceIp`) | Only these viewer IP ranges (CIDR) | No | Yes |
+| `Resource` | Which URL(s) | Exact URL only | Yes, with `*` wildcards |
+
+- **Canned policy**: shortest URL, just an expiry for one exact URL. Query parameters: `Expires`, `Signature`, `Key-Pair-Id`.
+- **Custom policy**: a JSON policy you write, Base64-encoded into the URL. Query parameters: `Policy`, `Signature`, `Key-Pair-Id`. Needed for start times, IP filters or wildcard paths, and it is what signed cookies normally use to cover many files.
+- **Who can sign** is not in the policy itself: it is set on the cache behavior as **trusted signers**, either **trusted key groups** (recommended) or, the legacy way, AWS accounts holding a root-managed CloudFront key pair.
+
+```json
+{
+  "Statement": [
+    {
+      "Resource": "https://d111111abcdef8.cloudfront.net/courses/aws-dva/*",
+      "Condition": {
+        "DateLessThan": { "AWS:EpochTime": 1767225600 },
+        "DateGreaterThan": { "AWS:EpochTime": 1764547200 },
+        "IpAddress": { "AWS:SourceIp": "203.0.113.0/24" }
+      }
+    }
+  ]
+}
+```
+
+- Times are **Unix epoch seconds** (UTC). Only one `Statement` is allowed.
+
+### ⏱️ How Long Should It Be Valid?
+
+| Content | Validity | Why |
+| --- | --- | --- |
+| **Shared** content (a movie or song every subscriber can get) | **Short**, a few minutes | A leaked URL works for anyone until it expires |
+| **Private** content (a user's own invoice, their own files) | **Long**, even months or years | Only that user has a reason to use it |
+
+- CloudFront checks the expiry when the request **arrives**, so a large download that started in time still completes.
+
+### 🔀 Signed URL vs Signed Cookies
+
+| | **Signed URL** | **Signed Cookies** |
+| --- | --- | --- |
+| Grants access to | **One file** per URL | **Many files** with one set of cookies |
+| URL changes? | Yes, query string added | No, URLs stay clean |
+| Typical use | A single download, a file link in an email, clients that don't support cookies | **HLS/DASH video** (hundreds of segment files), a whole members-only area of a site |
+| Policy | Canned or custom | Usually custom (wildcard path) |
+| What's sent | `Expires` or `Policy`, `Signature`, `Key-Pair-Id` query parameters | `CloudFront-Expires` or `CloudFront-Policy`, `CloudFront-Signature`, `CloudFront-Key-Pair-Id` cookies |
+
+- Signed cookies are set by **your application** (a `Set-Cookie` response after login). The browser only sends them to CloudFront if the cookie **domain** matches, so serve the distribution on a **custom domain** under the same parent domain as the app (e.g. app on `www.example.com`, CDN on `media.example.com`, cookies for `.example.com`).
+
+### 🔄 The Flow
+
+```mermaid
+sequenceDiagram
+    participant C as Client
+    participant A as App (EC2 or Lambda)
+    participant CF as CloudFront edge
+    participant S3 as S3 bucket (private, OAC)
+    C->>A: Log in, request premium video
+    A->>A: Authenticate and authorise
+    A->>A: Sign policy with private key (AWS SDK)
+    A-->>C: Signed URL (or Set-Cookie)
+    C->>CF: GET object with signature
+    CF->>CF: Verify signature with public key, check expiry and IP
+    alt Valid and cached
+        CF-->>C: Object from edge cache
+    else Valid, cache miss
+        CF->>S3: Fetch via OAC
+        S3-->>CF: Object
+        CF-->>C: Object
+    else Invalid or expired
+        CF-->>C: 403 Forbidden
+    end
+```
+
+- The private key **never leaves your application**. CloudFront only holds the **public key**.
+- Verification happens at the edge, so it **works with caching**: the signature query parameters are not part of the cache key by default, so all users share the same cached object.
+
+### ⚖️ CloudFront Signed URL vs S3 Pre-Signed URL
+
+| | **CloudFront Signed URL** | **S3 Pre-Signed URL** |
+| --- | --- | --- |
+| Works on | A CloudFront path, **whatever the origin** (S3, ALB, EC2, custom HTTP) | **S3 objects only** |
+| Signed with | Your own **key pair** (public key in a CloudFront key group) | The **IAM credentials** of the principal who signs (SigV4) |
+| Permissions | Whatever the policy allows | Request runs **as the signer**; it inherits their IAM permissions |
+| Filters | Expiry, start time, **IP range**, **path wildcards** | Expiry only (plus the signer's IAM policy) |
+| Lifetime | Anything you choose | Max **7 days** with IAM user keys; capped by the session lifetime for role credentials |
+| Caching / edge | Yes, served from edge caches | No, straight to the S3 endpoint |
+| Uploads (PUT) | Possible but unusual | Common pattern for direct uploads |
+
+```mermaid
+graph LR
+    subgraph CFS["CloudFront Signed URL"]
+        C1["Client"] -->|"signed URL"| E["Edge location"] --> O["Any origin (S3 via OAC, ALB, EC2)"]
+    end
+    subgraph S3P["S3 Pre-Signed URL"]
+        C2["Client"] -->|"pre-signed URL"| B["S3 bucket directly"]
+    end
+```
+
+> **Important**: The slides describe the CloudFront key pair as "account-wide, only the root can manage it". That is the **legacy** trusted-signer method. Today you use **trusted key groups**: public keys are managed by normal IAM principals through the CloudFront console or API, and the root account is not needed. The exam can still mention both; key groups are the recommended answer.
+
+### 🧑‍💻 Node.js: Generate a Signed URL and Signed Cookies
+
+Use the helper package `@aws-sdk/cloudfront-signer` (part of AWS SDK v3). Signing happens locally with the private key; no AWS API call is made.
+
+```bash
+npm install @aws-sdk/cloudfront-signer @aws-sdk/client-secrets-manager
+```
+
+```javascript
+import { getSignedUrl, getSignedCookies } from "@aws-sdk/cloudfront-signer";
+import { SecretsManagerClient, GetSecretValueCommand } from "@aws-sdk/client-secrets-manager";
+
+const sm = new SecretsManagerClient({});
+// Keep the private key out of code: Secrets Manager (or SSM Parameter Store SecureString)
+const { SecretString: privateKey } = await sm.send(
+  new GetSecretValueCommand({ SecretId: "cloudfront/signing-private-key" })
+);
+
+const keyPairId = "K2JCJMDEHXQW5F"; // ID of the PUBLIC KEY in the trusted key group
+const base = "https://media.example.com";
+
+// 1) Canned policy: one file, expires in 5 minutes
+export const signedUrl = getSignedUrl({
+  url: `${base}/downloads/ebook.pdf`,
+  keyPairId,
+  privateKey,
+  dateLessThan: new Date(Date.now() + 5 * 60 * 1000).toISOString(),
+});
+
+// 2) Custom policy as cookies: every file under /courses/aws-dva/, from one IP range
+const policy = JSON.stringify({
+  Statement: [
+    {
+      Resource: `${base}/courses/aws-dva/*`,
+      Condition: {
+        DateLessThan: { "AWS:EpochTime": Math.floor(Date.now() / 1000) + 3600 },
+        IpAddress: { "AWS:SourceIp": "203.0.113.0/24" },
+      },
+    },
+  ],
+});
+
+export const cookies = getSignedCookies({ keyPairId, privateKey, policy });
+// { "CloudFront-Policy": "...", "CloudFront-Signature": "...", "CloudFront-Key-Pair-Id": "..." }
+```
+
+Returning the cookies from a Lambda function behind an API Gateway HTTP API:
+
+```javascript
+export const handler = async () => {
+  const attrs = "Domain=.example.com; Path=/; Secure; HttpOnly; SameSite=Lax";
+  return {
+    statusCode: 200,
+    cookies: Object.entries(cookies).map(([name, value]) => `${name}=${value}; ${attrs}`),
+    body: JSON.stringify({ ok: true }),
+  };
+};
+```
+
+A signed URL with a custom policy looks like this:
+
+```text
+https://media.example.com/courses/aws-dva/intro.mp4?Policy=eyJTdGF0ZW1lbnQiOlt7...&Signature=Nql641NHE...~Xp9A__&Key-Pair-Id=K2JCJMDEHXQW5F
+```
+
+- The policy and signature are Base64 with URL-safe substitutions (`+` → `-`, `=` → `_`, `/` → `~`); the helper does this for you.
+
+### 🛠️ In Practice
+
+- **Store the private key in Secrets Manager** (or Parameter Store `SecureString`) and load it once per Lambda execution environment, outside the handler. Never commit it or bake it into an image.
+- **Rotate keys** by adding a second public key to the key group, switching the app to the new key, then removing the old one after outstanding URLs expire.
+- Always pair restricted viewer access with **OAC on the S3 origin** (or a secret header or VPC origin for ALB origins). A signed CDN in front of a public bucket protects nothing.
+- Don't add the `Policy`, `Signature` or `Expires` query strings to the **cache key**: you would get one cache entry per user and lose the caching benefit.
+- Use a **custom domain** for signed cookies, otherwise the browser won't send your app's cookies to `*.cloudfront.net`.
+- Debugging 403s: check the expiry (seconds vs milliseconds is a classic bug), the exact `Resource` URL including scheme and domain, that the cache behavior really lists the key group, and that IP conditions match the viewer's **public** IP (NAT, proxies, IPv6).
+- Mixed site: put only the premium path (e.g. `/premium/*`) behind a cache behavior with restricted access, and leave `/*` public.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Distribute paid or premium content worldwide, only to authorised users"** → **CloudFront signed URL or signed cookies**.
+- **"Access to one file"** → **signed URL**. **"Access to many files, don't want to change URLs, streaming segments"** → **signed cookies**.
+- **"Restrict by IP address, start date or path wildcard"** → **custom policy** (canned only supports an expiry).
+- **"Private content served from an ALB or EC2 origin"** → **CloudFront** signed URLs (S3 pre-signed URLs only work for S3).
+- **"Temporary access to an S3 object using the signer's IAM permissions, or direct uploads to S3"** → **S3 pre-signed URL**.
+- **"Who can create signed URLs?"** → **trusted key groups** (recommended, managed with IAM and the API) vs the legacy **CloudFront key pair** that needs the **root account**.
+- Signed URLs don't stop direct origin access; the full answer usually adds **OAC** (S3) so nobody bypasses CloudFront.
+- Shared content → **short** expiry; private per-user content → can be **long**.
+
+### 📝 Key Exam Takeaways
+
+- Signed URLs and cookies attach a **policy**: expiry (required), plus optional **IP range**, **start time** and **path wildcard** (custom policy).
+- **Signed URL = one file**, **signed cookies = many files**.
+- Your app authenticates the user, then signs with a **private key** using the SDK; CloudFront verifies with the **public key** in a **trusted key group**.
+- **CloudFront signed URL**: any origin, IP, path and date filters, uses edge caching, your own key pair.
+- **S3 pre-signed URL**: S3 only, signed with the **IAM credentials** of the signer, request runs with their permissions, limited lifetime (max 7 days).
+- Combine with **OAC** so the origin can't be reached except through CloudFront.
+
+---

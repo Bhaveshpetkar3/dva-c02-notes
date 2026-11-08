@@ -1644,3 +1644,273 @@ https://media.example.com/courses/aws-dva/intro.mp4?Policy=eyJTdGF0ZW1lbnQiOlt7.
 - Combine with **OAC** so the origin can't be reached except through CloudFront.
 
 ---
+
+## Lecture 162: 🗝️ CloudFront Signed URL - Key Groups + Hands On
+
+> **Overview**: Before CloudFront can verify a signed URL, it needs to know **who is allowed to sign**. This lecture compares the two kinds of signer, the recommended **trusted key group** and the legacy **root-managed CloudFront key pair**, then walks through generating an RSA key pair, uploading the public key, creating a key group and attaching it to a cache behavior. The private key stays with your application; CloudFront only ever sees the public key.
+
+### 🔑 Two Kinds of Trusted Signer
+
+| | **Trusted key group** (recommended) | **CloudFront key pair** (legacy trusted signer) |
+| --- | --- | --- |
+| Who manages it | Any IAM principal allowed to call the public key and key group APIs | **Only the root user**, in the console (**Security credentials** → **CloudFront key pairs**) |
+| API / IaC support | Yes: CloudFront API, CLI, SDK, CloudFormation (`AWS::CloudFront::PublicKey`, `AWS::CloudFront::KeyGroup`) | No API, console only |
+| Who generates the keys | **You** (e.g. with OpenSSL), then upload the public key | AWS could generate the pair, or you upload a public key |
+| What is trusted on the behavior | Specific **key groups** | A whole **AWS account** |
+| Rotation | Easy: add a new public key to the group, switch, remove the old one | Manual, root login each time |
+| `Key-Pair-Id` in the URL | The **public key ID** (e.g. `K2JCJMDEHXQW5F`) | The **key pair ID** (e.g. `APKA...`) |
+
+- Using the root user for routine work breaks IAM best practice, which is why the key pair method is **not recommended**.
+- Key groups let you control **who can create or rotate keys with IAM**, and those API calls are recorded in **CloudTrail**.
+
+> **Analogy**: The key group is the **guest list at the door** (CloudFront). You give the bouncer photos of the people allowed to vouch for guests (public keys). Your app keeps the actual signet ring (private key) and stamps tickets with it. The bouncer never needs the ring, only the photo to compare against.
+
+### 🧩 How the Pieces Fit Together
+
+```mermaid
+graph LR
+    G["OpenSSL: generate RSA 2048 key pair"] --> PRIV["private_key.pem"]
+    G --> PUB["public_key.pem"]
+    PRIV --> SM["Secrets Manager"]
+    SM --> APP["App (EC2, Lambda) signs URLs"]
+    PUB --> PK["CloudFront public key (ID K2J...)"]
+    PK --> KG["Key group"]
+    KG --> CB["Cache behavior: Restrict viewer access = Yes"]
+    APP -->|"signed URL with Key-Pair-Id"| EDGE["CloudFront edge verifies"]
+    CB --> EDGE
+```
+
+| Object | What it is | Default quota |
+| --- | --- | --- |
+| **Public key** | An uploaded PEM public key; CloudFront gives it an ID | **10 per account** |
+| **Key group** | A named set of public keys | **5 public keys per group**, **10 key groups per account** |
+| **Cache behavior** | Where you switch on restricted viewer access and pick key groups | **4 key groups per distribution** |
+
+- A URL is valid if it is signed by **any** private key whose public key is in **any** key group attached to that behavior.
+- Restriction is set **per cache behavior**, so `/premium/*` can be signed-only while `/*` stays public.
+
+### 🧪 Hands On: Create a Key Group and Protect a Behavior
+
+#### 1️⃣ Generate the key pair locally
+
+CloudFront expects an **RSA 2048-bit** key, PEM-encoded.
+
+```bash
+# Private key: keep it secret, never upload it to CloudFront
+openssl genrsa -out private_key.pem 2048
+
+# Public key: this is what you upload
+openssl rsa -pubout -in private_key.pem -out public_key.pem
+
+cat public_key.pem
+# -----BEGIN PUBLIC KEY-----
+# MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA...
+# -----END PUBLIC KEY-----
+```
+
+- Paste the **whole** public key, including the `BEGIN` and `END` lines.
+- Online key generators are fine for a throwaway demo, but generate real keys yourself so the private key never touches a third-party site.
+
+#### 2️⃣ Upload the public key
+
+1. **CloudFront console** → left menu **Key management** → **Public keys** → **Create public key**.
+2. Give it a name (e.g. `demo-signing-key-2026`) and paste the contents of `public_key.pem`.
+3. **Create**. Note the **ID** shown in the list (e.g. `K2JCJMDEHXQW5F`): this is the value your app sends as `Key-Pair-Id`.
+
+#### 3️⃣ Create the key group
+
+1. **Key management** → **Key groups** → **Create key group**.
+2. Name it (e.g. `premium-content-signers`) and select the public key from step 2.
+3. **Create key group**.
+
+#### 4️⃣ Attach it to the distribution
+
+1. Open the distribution → **Behaviors** tab → select the behavior (e.g. `Default (*)` or `/premium/*`) → **Edit**.
+2. **Restrict viewer access** → **Yes**.
+3. **Trusted authorization type** → **Trusted key groups (recommended)**, then add `premium-content-signers`. The other option, **Trusted signer**, is the legacy account-based method.
+4. **Save changes** and wait for the distribution status to return to **Deployed**.
+
+#### 5️⃣ Test it
+
+```bash
+# Unsigned request: now rejected
+curl -i https://d111111abcdef8.cloudfront.net/coffee.jpg
+# HTTP/2 403 ... <Code>MissingKey</Code>
+
+# Sign a URL with the CLI (signing happens locally, no API call)
+aws cloudfront sign \
+  --url https://d111111abcdef8.cloudfront.net/coffee.jpg \
+  --key-pair-id K2JCJMDEHXQW5F \
+  --private-key file://private_key.pem \
+  --date-less-than 2026-12-31
+
+# Open the returned URL in a browser or curl it: 200 OK
+```
+
+What you should see:
+
+- Without a signature: **403** with an XML error body (`MissingKey`).
+- With a valid signed URL: the object loads, and repeated requests come from the edge cache (`X-Cache: Hit from cloudfront`).
+- Tampered signature, unknown key ID or past expiry: **403** again.
+
+#### 6️⃣ Clean up
+
+1. Edit the behavior → **Restrict viewer access** → **No**, otherwise later demos on the same distribution stop working. Wait for **Deployed**.
+2. Delete the **key group**, then the **public key**. CloudFront refuses to delete a key group still attached to a behavior, or a public key still in a key group.
+3. Delete `private_key.pem` from your machine.
+
+### 💻 CLI: Do It Without the Console
+
+The PEM spans several lines, so pass the config as a JSON file:
+
+```json
+{
+  "CallerReference": "demo-2026-11-08",
+  "Name": "demo-signing-key-2026",
+  "EncodedKey": "-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqh...\n-----END PUBLIC KEY-----\n",
+  "Comment": "Signs /premium/* URLs"
+}
+```
+
+```bash
+# 1) Upload the public key -> returns PublicKey.Id (e.g. K2JCJMDEHXQW5F)
+aws cloudfront create-public-key --public-key-config file://public-key-config.json
+
+# 2) Create the key group containing it -> returns KeyGroup.Id
+aws cloudfront create-key-group \
+  --key-group-config Name=premium-content-signers,Items=K2JCJMDEHXQW5F
+
+# 3) List what exists
+aws cloudfront list-public-keys
+aws cloudfront list-key-groups
+```
+
+The part of a cache behavior in the distribution config that turns restriction on:
+
+```json
+{
+  "TrustedKeyGroups": {
+    "Enabled": true,
+    "Quantity": 1,
+    "Items": ["7d3f0c1a-1111-2222-3333-444455556666"]
+  },
+  "TrustedSigners": {
+    "Enabled": false,
+    "Quantity": 0
+  }
+}
+```
+
+### 🧑‍💻 Node.js: Create the Key Group and Attach It
+
+```javascript
+import { readFile } from "node:fs/promises";
+import {
+  CloudFrontClient,
+  CreatePublicKeyCommand,
+  CreateKeyGroupCommand,
+  GetDistributionConfigCommand,
+  UpdateDistributionCommand,
+} from "@aws-sdk/client-cloudfront";
+
+const cf = new CloudFrontClient({ region: "us-east-1" }); // CloudFront is global
+const Id = "EDFDVBD6EXAMPLE";
+
+// 1) Upload the public key
+const { PublicKey } = await cf.send(
+  new CreatePublicKeyCommand({
+    PublicKeyConfig: {
+      CallerReference: `key-${Date.now()}`, // idempotency token
+      Name: "demo-signing-key-2026",
+      EncodedKey: await readFile("public_key.pem", "utf8"),
+    },
+  })
+);
+
+// 2) Put it in a key group
+const { KeyGroup } = await cf.send(
+  new CreateKeyGroupCommand({
+    KeyGroupConfig: { Name: "premium-content-signers", Items: [PublicKey.Id] },
+  })
+);
+
+// 3) Restrict viewer access on the default cache behavior
+const { DistributionConfig, ETag } = await cf.send(new GetDistributionConfigCommand({ Id }));
+DistributionConfig.DefaultCacheBehavior.TrustedKeyGroups = {
+  Enabled: true,
+  Quantity: 1,
+  Items: [KeyGroup.Id],
+};
+await cf.send(new UpdateDistributionCommand({ Id, IfMatch: ETag, DistributionConfig }));
+
+console.log("Sign URLs with Key-Pair-Id =", PublicKey.Id);
+```
+
+- Signing itself uses `@aws-sdk/cloudfront-signer` (`getSignedUrl`, `getSignedCookies`) as shown in Lecture 161. The `keyPairId` you pass is the **public key ID**, not the key group ID.
+
+IAM permissions the deploying principal needs:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "cloudfront:CreatePublicKey",
+        "cloudfront:CreateKeyGroup",
+        "cloudfront:UpdateKeyGroup",
+        "cloudfront:GetDistributionConfig",
+        "cloudfront:UpdateDistribution"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
+
+- The application that **signs** URLs needs **no CloudFront permissions** at all, only access to the private key (e.g. `secretsmanager:GetSecretValue`). Signing is pure local cryptography.
+
+### 🔄 Rotating Keys Without Downtime
+
+```mermaid
+sequenceDiagram
+    participant Ops as You
+    participant KG as Key group
+    participant App as App (signer)
+    Ops->>KG: Upload public key B and add it (A and B trusted)
+    Ops->>App: Store private key B, switch Key-Pair-Id to B
+    Note over App,KG: URLs signed with A stay valid until they expire
+    Ops->>KG: After the longest URL lifetime, remove key A
+    Ops->>Ops: Delete public key A and private key A
+```
+
+- Works because a group holds up to **5** keys and CloudFront accepts a signature from any of them.
+
+### 🛠️ In Practice
+
+- Define the public key and key group in **CloudFormation / SAM / CDK** (`AWS::CloudFront::PublicKey`, `AWS::CloudFront::KeyGroup`, `TrustedKeyGroups` on the behavior) so every environment is reproducible. Only the private key lives outside the template, in **Secrets Manager**.
+- Use **one key group per purpose** (e.g. video vs downloads) so you can revoke one without touching the other.
+- Put a date or version in public key names (`signing-key-2026-11`) so rotation state is obvious.
+- If a private key leaks, **remove its public key from the group**: URLs signed with it stop working once the change deploys, without waiting for them to expire.
+- 403 after enabling restriction? Check that `Key-Pair-Id` is the **public key ID**, that the key is in a group attached to **that** behavior (not another path pattern), and that the distribution has finished deploying.
+- Restricting the default `*` behavior locks the whole site, including HTML and JS. For mixed sites restrict only the premium path patterns.
+
+### 🎯 DVA-C02 Exam Tips
+
+- **"Which signer should you use for CloudFront signed URLs?"** → **trusted key group**. An answer involving the **root account** and a CloudFront key pair is the legacy, not-recommended option.
+- **"Manage and rotate signing keys with IAM or the API, without root"** → **key groups**.
+- **"Who holds which key?"** → your app (EC2, Lambda) holds the **private key** and signs; CloudFront holds the uploaded **public key** and verifies.
+- **"Users get 403 from CloudFront after enabling restricted viewer access"** → requests are unsigned, signed with a key not in the trusted key group, or expired.
+- Don't confuse with **OAC**: OAC secures **CloudFront → S3**; key groups and signed URLs secure **viewer → CloudFront**. Private content usually needs **both**.
+- Don't confuse with **ACM** (HTTPS certificates) or **KMS** keys: CloudFront signing keys are your own RSA key pair, managed by neither.
+
+### 📝 Key Exam Takeaways
+
+- Two signer types: **trusted key group** (recommended, managed with IAM and the API) and **CloudFront key pair** (legacy, root user only).
+- You **generate the RSA key pair yourself**, upload only the **public key** to CloudFront and add it to a **key group**.
+- Turn on **Restrict viewer access** on a **cache behavior** and select the key group(s).
+- The private key signs URLs in your app; the `Key-Pair-Id` in the URL is the **public key ID**.
+- Key groups make **rotation** easy: up to 5 keys per group, add the new key before removing the old one.
+
+---
